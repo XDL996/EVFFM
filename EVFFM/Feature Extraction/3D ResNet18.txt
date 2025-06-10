@@ -1,0 +1,101 @@
+import os
+import glob
+import torch
+import pandas as pd
+import SimpleITK as sitk
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models.video import r3d_18
+
+
+class NonLocalBlock3D(nn.Module):
+    def __init__(self, in_channels, inter_channels=None):
+        super(NonLocalBlock3D, self).__init__()
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels or max(1, in_channels // 2)
+
+        self.g = nn.Conv3d(in_channels, self.inter_channels, kernel_size=1)
+        self.theta = nn.Conv3d(in_channels, self.inter_channels, kernel_size=1)
+        self.phi = nn.Conv3d(in_channels, self.inter_channels, kernel_size=1)
+        self.W = nn.Conv3d(self.inter_channels, in_channels, kernel_size=1)
+
+        nn.init.constant_(self.W.weight, 0)
+        nn.init.constant_(self.W.bias, 0)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        g_x = self.g(x).view(batch_size, self.inter_channels, -1).permute(0, 2, 1)
+        theta_x = self.theta(x).view(batch_size, self.inter_channels, -1).permute(0, 2, 1)
+        phi_x = self.phi(x).view(batch_size, self.inter_channels, -1)
+
+        f = torch.matmul(theta_x, phi_x)
+        f_div_C = F.softmax(f, dim=-1)
+
+        y = torch.matmul(f_div_C, g_x).permute(0, 2, 1).contiguous()
+        y = y.view(batch_size, self.inter_channels, *x.size()[2:])
+        return self.W(y)
+
+
+class AttentionModule(nn.Module):
+    def __init__(self, channels):
+        super(AttentionModule, self).__init__()
+        self.non_local_block = NonLocalBlock3D(channels)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        attention = self.sigmoid(self.non_local_block(x))
+        return x * attention
+
+
+def build_model():
+    model = r3d_18(pretrained=True)
+    model.stem[0] = nn.Conv3d(1, 64, kernel_size=(3, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3), bias=False)
+    # Attention module can be added to specific blocks here if desired
+    return nn.Sequential(*list(model.children())[:-1])
+
+
+def preprocess_image(img_path, mask_path):
+    img = sitk.ReadImage(img_path)
+    mask = sitk.ReadImage(mask_path)
+    img_arr = sitk.GetArrayFromImage(img).astype('float32')
+    mask_arr = sitk.GetArrayFromImage(mask).astype('float32')
+
+    img_arr = (img_arr / 255.0 - img_arr.mean()) / img_arr.std()
+    mask_arr /= mask_arr.max()
+    return (img_arr * mask_arr)[np.newaxis, np.newaxis, ...]
+
+
+def extract_features(img_path, mask_path, model, use_gpu=False):
+    img_tensor = torch.from_numpy(preprocess_image(img_path, mask_path))
+    if use_gpu:
+        img_tensor = img_tensor.cuda()
+        model = model.cuda()
+    with torch.no_grad():
+        features = model(img_tensor).cpu().squeeze().numpy()
+    return features
+
+
+def extract_all_features(data_dir, mask_dir, model, use_gpu=False):
+    img_files = sorted(glob.glob(os.path.join(data_dir, '*.nii.gz')))
+    mask_files = sorted(glob.glob(os.path.join(mask_dir, '*.nii.gz')))
+
+    if not img_files or not mask_files:
+        raise ValueError("No image or mask files found.")
+
+    all_features = []
+    for img_path, mask_path in zip(img_files, mask_files):
+        file_name = os.path.basename(img_path).split('.')[0]
+        print(f'Processing: {file_name}')
+        features = extract_features(img_path, mask_path, model, use_gpu)
+        all_features.append([file_name, img_path, mask_path] + features.tolist())
+
+
+
+if __name__ == '__main__':
+    data_dir = r'' 
+    mask_dir = r''  
+    use_gpu = torch.cuda.is_available()
+
+    model = build_model()
+    extract_all_features(data_dir, mask_dir, model, use_gpu)
